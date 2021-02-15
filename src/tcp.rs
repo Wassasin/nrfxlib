@@ -72,7 +72,7 @@ impl TcpSocket {
 
 	/// Look up the hostname and for each result returned, try to connect to
 	/// it.
-	pub fn connect(&self, hostname: &str, port: u16) -> Result<(), Error> {
+	pub fn connect(&self, hostname: &str, port: u16, timeout: u32) -> Result<(), Error> {
 		use core::fmt::Write;
 
 		debug!("Connecting via TCP to {}:{}", hostname, port);
@@ -120,6 +120,16 @@ impl TcpSocket {
 
 				debug!("Trying IP address {}", &crate::NrfSockAddrIn(connect_addr));
 
+				let flags = unsafe { sys::nrf_fcntl(self.socket.fd, sys::NRF_F_GETFL as i32, 0) };
+
+				unsafe {
+					sys::nrf_fcntl(
+						self.socket.fd,
+						sys::NRF_F_SETFL as i32,
+						flags | sys::NRF_O_NONBLOCK as i32,
+					);
+				}
+
 				// try and connect to this result
 				result = unsafe {
 					sys::nrf_connect(
@@ -128,6 +138,43 @@ impl TcpSocket {
 						connect_addr.sin_len as u32,
 					)
 				};
+
+				let mut fdset: sys::nrf_fd_set = 1 << (self.socket.fd);
+				let select_result = unsafe {
+					sys::nrf_select(
+						self.socket.fd + 1,
+						core::ptr::null::<sys::nrf_fd_set>() as *mut sys::nrf_fd_set,
+						&mut fdset,
+						core::ptr::null::<sys::nrf_fd_set>() as *mut sys::nrf_fd_set,
+						&sys::nrf_timeval {
+							tv_sec: timeout,
+							tv_usec: 0,
+						},
+					)
+				};
+
+				if select_result == 1 {
+					let mut value = 0u16;
+					let mut length: u32 = core::mem::size_of_val(&value) as u32;
+					unsafe {
+						sys::nrf_getsockopt(
+							self.socket.fd,
+							sys::NRF_SOL_SOCKET as i32,
+							sys::NRF_SO_ERROR as i32,
+							&mut value as *mut u16 as *mut sys::ctypes::c_void,
+							&mut length as *mut u32,
+						)
+					};
+
+					result = value as i32;
+				} else if select_result == 0 {
+					// Timeout
+					break;
+				}
+
+				// Reset the descriptor flags to the original
+				unsafe { sys::nrf_fcntl(self.socket.fd, sys::NRF_F_SETFL as i32, flags) };
+
 				if result == 0 {
 					break;
 				}
